@@ -139,4 +139,4 @@ export default {
     const upstream = await proxyToOrigin(request, env);
     return applyCors(upstream, request);
   },
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<Env>; 
