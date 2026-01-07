@@ -486,9 +486,56 @@ async function createPaidOrderInOrigin(env: Env, payload: unknown): Promise<{ or
 export class MyDurableObject extends DurableObject<Env> {
   private state: DurableObjectState;
 
+  private sockets: Set<WebSocket> = new Set();
+
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
     this.state = state;
+  }
+
+  private safeSend(ws: WebSocket, data: unknown) {
+    try {
+      ws.send(JSON.stringify(data));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private broadcast(data: unknown) {
+    for (const ws of this.sockets) {
+      const ok = this.safeSend(ws, data);
+      if (!ok) this.sockets.delete(ws);
+    }
+  }
+
+  private async handleWs(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("expected websocket", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+
+    server.accept();
+    this.sockets.add(server);
+
+    server.addEventListener("close", () => this.sockets.delete(server));
+    server.addEventListener("error", () => this.sockets.delete(server));
+
+    // Optional: respond to pings from client (keeps some proxies happy)
+    server.addEventListener("message", (evt: MessageEvent) => {
+      const msg = typeof evt.data === "string" ? evt.data : "";
+      if (msg === "ping") {
+        this.safeSend(server, { type: "pong" });
+      }
+    });
+
+    // Immediately push current state
+    const session = (await this.state.storage.get<StoredSession>("session")) || null;
+    this.safeSend(server, { type: "session", session });
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -498,6 +545,8 @@ export class MyDurableObject extends DurableObject<Env> {
     if (url.pathname === "/status" && request.method === "GET") return this.handleStatus();
     if (url.pathname === "/markPaid" && request.method === "POST") return this.handleMarkPaid(request);
     if (url.pathname === "/finalize" && request.method === "POST") return this.handleFinalize();
+    if (url.pathname === "/ws") return this.handleWs(request);
+
 
     if (url.pathname === "/hello") return json({ ok: true, hello: "world" }, { status: 200 });
 
@@ -624,6 +673,7 @@ export class MyDurableObject extends DurableObject<Env> {
     if (stripe_customer_id) stored.stripe_customer_id = stripe_customer_id;
 
     await this.state.storage.put("session", stored);
+    this.broadcast({ type: "session", session: stored });
     return json({ ok: true, status: "paid", event_type: eventType }, { status: 200 });
   }
 
@@ -659,7 +709,7 @@ export class MyDurableObject extends DurableObject<Env> {
     stored.order_id = order_id;
     stored.origin_finalized_at = new Date().toISOString();
     await this.state.storage.put("session", stored);
-
+    this.broadcast({ type: "session", session: stored });
     return json({ ok: true, status: "finalized", order_id }, { status: 200 });
   }
 }
@@ -755,6 +805,25 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   await env.PROVOST_EVENT_QUEUE.send(payloadText);
   return new Response("ok", { status: 200 });
 }
+
+async function handleEdgeCheckoutWs(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const k = url.searchParams.get("k") || "";
+  if (!k) return new Response("missing k", { status: 400 });
+
+  // Must be a websocket upgrade request
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return new Response("expected websocket", { status: 426 });
+  }
+
+  const doId = env.MY_DURABLE_OBJECT.idFromName(`checkout:${k}`);
+  const stub = env.MY_DURABLE_OBJECT.get(doId);
+
+  // Forward the websocket upgrade to the Durable Object
+  const doReq = new Request("https://do.internal/ws", request);
+  return stub.fetch(doReq);
+}
+
 
 // -------------------- Queue consumer --------------------
 
@@ -856,6 +925,11 @@ export default {
       const resp = await handleEdgeCheckoutStatus(request, env);
       return applyCors(resp, request);
     }
+
+    if (url.pathname === "/edge/checkout/ws") {
+  return handleEdgeCheckoutWs(request, env);
+}
+
 
     if (url.pathname === "/webhooks/stripe") {
       const resp = await handleStripeWebhook(request, env);
