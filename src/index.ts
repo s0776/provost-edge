@@ -2,60 +2,168 @@
 import { DurableObject } from "cloudflare:workers";
 
 /**
- * Env bindings you MUST have (via wrangler.jsonc + secrets):
+ * HARD REQUIREMENT:
+ * - Django must NOT be touched until AFTER Stripe confirms payment.
+ *
+ * Env bindings required:
  * - MY_DURABLE_OBJECT (Durable Object namespace binding)
  * - PROVOST_EVENT_QUEUE (Queue binding)
- * - ORIGIN_BASE_URL (string var)
- * - FRONTEND_URL (string var)
+ * - ORIGIN_BASE_URL (var)  -> https://provost-api-....herokuapp.com
+ * - FRONTEND_URL (var)     -> https://joinprovost.com
  * - STRIPE_SECRET (secret)
  * - STRIPE_WEBHOOK_SECRET (secret)
+ * - INTERNAL_AUTH_SECRET (secret)  -> used ONLY after paid, inside /finalize
  *
  * Optional:
  * - EDGE_ADMIN_TOKEN (secret/var)
+ * - STRIPE_PRICE_MAP_JSON (var/secret) -> optional best-practice mapping to Stripe Price IDs
  */
 export interface Env {
   MY_DURABLE_OBJECT: DurableObjectNamespace;
-
-  // Queues binding (wrangler "queues.producers")
   PROVOST_EVENT_QUEUE: Queue;
 
-  // Reverse proxy origin (Heroku)
   ORIGIN_BASE_URL: string;
-
-  // For success/cancel URLs
   FRONTEND_URL: string;
 
-  // Stripe secrets
   STRIPE_SECRET: string;
   STRIPE_WEBHOOK_SECRET: string;
 
-  // Optional: lock down edge-only endpoints
+  INTERNAL_AUTH_SECRET: string;
+
+  STRIPE_PRICE_MAP_JSON?: string;
+
   EDGE_ADMIN_TOKEN?: string;
 }
 
-type CheckoutItem = {
-  name?: string;
-  currency?: string; // default usd
-  unit_amount_cents?: number; // required if no price_id
-  quantity?: number; // default 1
-  price_id?: string; // optional if you use Stripe Prices later
+// -------------------- Pricing + labels (ported from your Django) --------------------
+
+type TierId = "f50" | "f100" | "f1000";
+type Volume = 10 | 25 | 50 | 100;
+
+const PLACEHOLDER_SKU = "dynamic_package";
+
+// Matches core/pricing.py exactly (whole dollars)
+const BASE_PRICING_USD: Record<TierId, Record<Volume, number>> = {
+  f1000: { 10: 9, 25: 50, 50: 100, 100: 100 },
+  f100: { 10: 19, 25: 75, 50: 100, 100: 200 },
+  f50: { 10: 19, 25: 75, 50: 100, 100: 200 },
 };
 
-type CheckoutRequestBody = {
-  idempotency_key?: string;
-  items: CheckoutItem[];
+const BANKING_PRICING_USD: Record<TierId, Record<Volume, number>> = {
+  f1000: { 10: 9, 25: 50, 50: 100, 100: 100 },
+  f100: { 10: 19, 25: 75, 50: 100, 100: 200 },
+  f50: { 10: 29, 25: 100, 50: 150, 100: 200 },
+};
+
+const CONSULTING_PRICING_USD: Record<TierId, Record<Volume, number>> = {
+  f1000: { 10: 9, 25: 50, 50: 100, 100: 100 },
+  f100: { 10: 19, 25: 75, 50: 100, 100: 200 },
+  f50: { 10: 29, 25: 100, 50: 150, 100: 200 },
+};
+
+const TECHNOLOGY_PRICING_USD: Record<TierId, Record<Volume, number>> = {
+  f1000: { 10: 9, 25: 50, 50: 100, 100: 100 },
+  f100: { 10: 19, 25: 75, 50: 100, 100: 200 },
+  f50: { 10: 29, 25: 100, 50: 150, 100: 200 },
+};
+
+function tableForIndustry(industry_id: string): Record<TierId, Record<Volume, number>> {
+  if (industry_id === "banking") return BANKING_PRICING_USD;
+  if (industry_id === "consulting") return CONSULTING_PRICING_USD;
+  if (industry_id === "technology") return TECHNOLOGY_PRICING_USD;
+  return BASE_PRICING_USD;
+}
+
+function computePriceUsd(industry_id: string, tier_id: TierId, count: Volume): number {
+  const table = tableForIndustry(industry_id || "all");
+  return table[tier_id][count];
+}
+
+const INDUSTRY_LABELS: Record<string, string> = {
+  all: "All Companies",
+  banking: "Investment Banking",
+  technology: "Technology",
+  consulting: "Consulting",
+  entertainment: "Entertainment",
+  healthcare: "Healthcare",
+  industrial: "Industrial",
+  energy: "Energy",
+  consumer: "Consumer",
+  defense: "Defense",
+};
+
+// Your old backend label behavior
+const TIER_LABEL_DEFAULTS: Record<TierId, string> = {
+  f50: "Premium",
+  f100: "Premium",
+  f1000: "Standard",
+};
+
+const TIER_LABEL_OVERRIDES: Partial<Record<string, Partial<Record<TierId, string>>>> = {
+  banking: { f50: "Bulge Bracket", f100: "Middle Market", f1000: "Regional" },
+  consulting: { f50: "MBB", f100: "Big 4", f1000: "General" },
+  technology: { f50: "Premier", f100: "Mid-Tier", f1000: "Standard" },
+};
+
+function tierLabelForIndustry(tier_id: TierId, industry_id: string): string {
+  return TIER_LABEL_OVERRIDES[industry_id]?.[tier_id] || TIER_LABEL_DEFAULTS[tier_id] || String(tier_id);
+}
+
+// -------------------- Types --------------------
+
+type EdgeCartItemInput = {
+  tier_id: string;
+  industry_id?: string;
+  count: number;
+  quantity: number;
+};
+
+type EdgeCheckoutRequestBody = {
+  idempotency_key?: string; // browser nonce
+  items: EdgeCartItemInput[];
+};
+
+type NormalizedCartItem = {
+  tier_id: TierId;
+  industry_id: string;
+  count: Volume;
+  quantity: number;
+};
+
+type ComputedLineItem = NormalizedCartItem & {
+  unit_amount_cents: number;
+  line_total_cents: number;
+  display_name: string;
+  display_desc: string;
+  price_key: string; // industry:tier:count
 };
 
 type StoredSession = {
-  idempotency_key: string;
-  session_id: string;
+  effective_key: string; // nonce.cartHash
+  nonce: string;
+  cart_hash: string;
+
+  stripe_session_id: string;
   checkout_url: string;
+
   status: "created" | "paid";
   created_at: string;
   paid_at?: string;
-  items: CheckoutItem[];
+
+  // captured from webhook payload
+  customer_email?: string;
+  customer_phone?: string;
+  stripe_customer_id?: string;
+
+  // set only AFTER paid, once Django is reachable
+  order_id?: number;
+  origin_finalized_at?: string;
+
+  items: ComputedLineItem[];
   processed_event_ids?: string[];
 };
+
+// -------------------- Small helpers --------------------
 
 function json(data: unknown, init: ResponseInit = {}) {
   const headers = new Headers(init.headers);
@@ -65,10 +173,9 @@ function json(data: unknown, init: ResponseInit = {}) {
 
 function applyCors(resp: Response, req: Request) {
   const origin = req.headers.get("Origin");
-  const headers = new Headers(resp.headers);
-
   if (!origin) return resp;
 
+  const headers = new Headers(resp.headers);
   headers.set("Access-Control-Allow-Origin", origin);
   headers.append("Vary", "Origin");
   headers.set("Access-Control-Allow-Credentials", "true");
@@ -89,16 +196,190 @@ function isAllowedEdgeAdmin(req: Request, env: Env) {
   return req.headers.get("X-Edge-Admin") === env.EDGE_ADMIN_TOKEN;
 }
 
+function joinUrl(base: string, path: string) {
+  const b = base.replace(/\/+$/, "");
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${b}${p}`;
+}
+
+function isTierId(x: string): x is TierId {
+  return x === "f50" || x === "f100" || x === "f1000";
+}
+
+function isVolume(x: number): x is Volume {
+  return x === 10 || x === 25 || x === 50 || x === 100;
+}
+
+function normalizeItems(raw: unknown): { ok: true; items: NormalizedCartItem[] } | { ok: false; error: string } {
+  if (!Array.isArray(raw) || raw.length === 0) return { ok: false, error: "items_required" };
+
+  const out: NormalizedCartItem[] = [];
+
+  for (const r of raw) {
+    if (!r || typeof r !== "object") return { ok: false, error: "invalid_item" };
+    const it = r as any;
+
+    const tier_id = String(it.tier_id || "");
+    const industry_id = String(it.industry_id || "all") || "all";
+
+    const countNum = Number(it.count);
+    const qtyNum = Number(it.quantity);
+
+    if (!isTierId(tier_id)) return { ok: false, error: "invalid_tier_id" };
+    if (!Number.isFinite(countNum) || !isVolume(countNum)) return { ok: false, error: "invalid_count" };
+    if (!Number.isFinite(qtyNum) || qtyNum <= 0) return { ok: false, error: "invalid_quantity" };
+
+    // Match your old backend enforcement (UI locked to 10)
+    if (countNum !== 10) return { ok: false, error: "only_10_pack_allowed" };
+
+    out.push({
+      tier_id,
+      industry_id,
+      count: countNum,
+      quantity: Math.floor(qtyNum),
+    });
+  }
+
+  return { ok: true, items: out };
+}
+
+function computeLineItems(items: NormalizedCartItem[]): ComputedLineItem[] {
+  return items.map((it) => {
+    const price_usd = computePriceUsd(it.industry_id, it.tier_id, it.count);
+    const unit_amount_cents = Math.round(price_usd * 100);
+
+    const tier_label = tierLabelForIndustry(it.tier_id, it.industry_id);
+    const industry_label = INDUSTRY_LABELS[it.industry_id] || String(it.industry_id);
+
+    // EXACT format from your old Django checkout
+    const display_name = `${industry_label} • ${tier_label} • ${it.count}-Pack`;
+    const display_desc = `${it.count} verified recruiter emails • ${industry_label} • ${tier_label}`;
+
+    return {
+      ...it,
+      unit_amount_cents,
+      line_total_cents: unit_amount_cents * it.quantity,
+      display_name,
+      display_desc,
+      price_key: `${it.industry_id}:${it.tier_id}:${it.count}`,
+    };
+  });
+}
+
+function canonicalCartStringForHash(items: NormalizedCartItem[]): string {
+  const sorted = [...items].sort((a, b) => {
+    const ak = `${a.industry_id}|${a.tier_id}|${a.count}|${a.quantity}`;
+    const bk = `${b.industry_id}|${b.tier_id}|${b.count}|${b.quantity}`;
+    return ak.localeCompare(bk);
+  });
+  return JSON.stringify(sorted);
+}
+
+function hexFromArrayBuffer(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, "0");
+  return out;
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const enc = new TextEncoder();
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(text));
+  return hexFromArrayBuffer(digest);
+}
+
+// -------------------- Stripe Price ID mapping (best practice for large scale) --------------------
+// IMPORTANT:
+// Using Stripe "price_data + product_data" creates new Products/Prices over time.
+// At your scale, you want stable Price IDs per SKU.
+// Provide env.STRIPE_PRICE_MAP_JSON like:
+// { "all:f50:10": "price_...", "banking:f50:10": "price_...", ... }
+let _cachedPriceMap: Record<string, string> | null = null;
+
+function getPriceMap(env: Env): Record<string, string> {
+  if (_cachedPriceMap) return _cachedPriceMap;
+  const raw = env.STRIPE_PRICE_MAP_JSON;
+  if (!raw) {
+    _cachedPriceMap = {};
+    return _cachedPriceMap;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      _cachedPriceMap = parsed as Record<string, string>;
+      return _cachedPriceMap;
+    }
+  } catch {
+    // ignore; will behave like empty map
+  }
+  _cachedPriceMap = {};
+  return _cachedPriceMap;
+}
+
+// -------------------- Stripe session params --------------------
+
+function buildStripeSessionParams(args: {
+  env: Env;
+  effective_key: string;
+  items: ComputedLineItem[];
+}) {
+  const { env, effective_key, items } = args;
+
+  const params = new URLSearchParams();
+  params.set("mode", "payment");
+
+  // Match old behavior
+  params.set("allow_promotion_codes", "true");
+  params.set("phone_number_collection[enabled]", "true");
+
+  const frontend = (env.FRONTEND_URL || "").replace(/\/$/, "");
+  // Include k=<effective_key> so the success page can poll edge status without Django
+  params.set(
+    "success_url",
+    `${frontend}/checkout/success?session_id={CHECKOUT_SESSION_ID}&k=${encodeURIComponent(effective_key)}`
+  );
+  params.set("cancel_url", `${frontend}/#build`);
+
+  // Metadata for queue consumer routing
+  params.set("metadata[idempotency_key]", effective_key);
+  params.set("metadata[source]", "provost-edge");
+  params.set("metadata[product_sku]", PLACEHOLDER_SKU);
+
+  const selectedIndustries = Array.from(new Set(items.map((i) => i.industry_id))).sort();
+  params.set("metadata[selected_industries]", selectedIndustries.join(","));
+
+  // Best practice: prefer Price IDs if you set STRIPE_PRICE_MAP_JSON
+  const priceMap = getPriceMap(env);
+
+  items.forEach((it, idx) => {
+    params.set(`line_items[${idx}][quantity]`, String(it.quantity));
+
+    const mappedPriceId = priceMap[it.price_key];
+    if (mappedPriceId) {
+      // Uses stable Stripe Price (recommended for scale)
+      params.set(`line_items[${idx}][price]`, mappedPriceId);
+      return;
+    }
+
+    // Fallback: dynamic price_data (restores EXACT checkout look immediately)
+    params.set(`line_items[${idx}][price_data][currency]`, "usd");
+    params.set(`line_items[${idx}][price_data][unit_amount]`, String(it.unit_amount_cents));
+    params.set(`line_items[${idx}][price_data][product_data][name]`, it.display_name.slice(0, 250));
+    params.set(`line_items[${idx}][price_data][product_data][description]`, it.display_desc.slice(0, 250));
+  });
+
+  return params;
+}
+
+// -------------------- Reverse proxy (unchanged) --------------------
+
 async function proxyToOrigin(request: Request, env: Env): Promise<Response> {
   if (!env.ORIGIN_BASE_URL) return new Response("Missing ORIGIN_BASE_URL", { status: 500 });
 
   const incomingUrl = new URL(request.url);
   const originBase = new URL(env.ORIGIN_BASE_URL);
-
-  // Keep path + query, swap origin host
   const upstreamUrl = new URL(incomingUrl.pathname + incomingUrl.search, originBase);
 
-  // Copy headers, remove hop-by-hop headers
   const headers = new Headers(request.headers);
   headers.delete("host");
   headers.delete("connection");
@@ -110,7 +391,6 @@ async function proxyToOrigin(request: Request, env: Env): Promise<Response> {
   headers.delete("transfer-encoding");
   headers.delete("upgrade");
 
-  // Helpful forwarding headers (Django logs / debugging)
   headers.set("X-Forwarded-Host", incomingUrl.host);
   headers.set("X-Forwarded-Proto", incomingUrl.protocol.replace(":", ""));
   const ip = request.headers.get("CF-Connecting-IP");
@@ -119,24 +399,22 @@ async function proxyToOrigin(request: Request, env: Env): Promise<Response> {
     headers.set("X-Real-IP", ip);
   }
 
-  const init: RequestInit = {
+  return fetch(upstreamUrl.toString(), {
     method: request.method,
     headers,
     body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
     redirect: "manual",
     cf: { cacheTtl: 0, cacheEverything: false },
-  };
-
-  return fetch(upstreamUrl.toString(), init);
+  });
 }
 
-// ---------- Stripe webhook signature verification (Worker-native, no Stripe SDK) ----------
+// -------------------- Stripe webhook signature verify (unchanged) --------------------
+
 function parseStripeSigHeader(sigHeader: string | null): { t: string; v1s: string[] } | null {
   if (!sigHeader) return null;
   const parts = sigHeader.split(",").map((s) => s.trim());
   let t = "";
   const v1s: string[] = [];
-
   for (const p of parts) {
     const [k, v] = p.split("=");
     if (!k || !v) continue;
@@ -145,13 +423,6 @@ function parseStripeSigHeader(sigHeader: string | null): { t: string; v1s: strin
   }
   if (!t || v1s.length === 0) return null;
   return { t, v1s };
-}
-
-function hexFromArrayBuffer(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, "0");
-  return out;
 }
 
 function timingSafeEqualHex(a: string, b: string): boolean {
@@ -163,13 +434,9 @@ function timingSafeEqualHex(a: string, b: string): boolean {
 
 async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+  ]);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
   return hexFromArrayBuffer(sig);
 }
@@ -178,7 +445,6 @@ async function verifyStripeWebhook(payloadText: string, sigHeader: string | null
   const parsed = parseStripeSigHeader(sigHeader);
   if (!parsed) return false;
 
-  // Stripe signs: `${t}.${payload}`
   const signedPayload = `${parsed.t}.${payloadText}`;
   const expected = await hmacSha256Hex(secret, signedPayload);
 
@@ -188,73 +454,36 @@ async function verifyStripeWebhook(payloadText: string, sigHeader: string | null
   return false;
 }
 
-// ---------- Stripe Checkout Session creation (Worker-native REST call) ----------
-function normalizeItem(it: CheckoutItem): Required<Pick<CheckoutItem, "currency" | "quantity">> & CheckoutItem {
-  return {
-    ...it,
-    currency: (it.currency || "usd").toLowerCase(),
-    quantity: Math.max(1, Math.floor(it.quantity ?? 1)),
-  };
-}
+// -------------------- Django internal call (ONLY AFTER PAID) --------------------
 
-function validateCheckoutBody(
-  body: CheckoutRequestBody
-): { ok: true; value: CheckoutRequestBody } | { ok: false; error: string } {
-  if (!body || typeof body !== "object") return { ok: false, error: "invalid_json" };
-  if (!Array.isArray(body.items) || body.items.length === 0) return { ok: false, error: "items_required" };
-  if (body.items.length > 20) return { ok: false, error: "too_many_items" };
-
-  for (const it of body.items) {
-    const n = normalizeItem(it);
-    const hasPriceId = typeof n.price_id === "string" && n.price_id.length > 0;
-    const hasPriceData =
-      typeof n.unit_amount_cents === "number" && Number.isFinite(n.unit_amount_cents) && n.unit_amount_cents > 0;
-
-    if (!hasPriceId && !hasPriceData) return { ok: false, error: "each_item_requires_price_id_or_unit_amount_cents" };
-    if (!hasPriceId) {
-      const nm = (n.name || "").trim();
-      if (!nm) return { ok: false, error: "each_item_requires_name_when_using_unit_amount_cents" };
-    }
-  }
-
-  return { ok: true, value: body };
-}
-
-function buildStripeSessionParams(env: Env, idempotency_key: string, items: CheckoutItem[]) {
-  const params = new URLSearchParams();
-
-  params.set("mode", "payment");
-  const frontend = (env.FRONTEND_URL || "").replace(/\/$/, "");
-  params.set("success_url", `${frontend}/checkout/success?session_id={CHECKOUT_SESSION_ID}`);
-  params.set("cancel_url", `${frontend}/checkout/cancel`);
-
-  params.set("metadata[idempotency_key]", idempotency_key);
-  params.set("metadata[source]", "provost-edge");
-
-  const normalized = items.map(normalizeItem);
-
-  normalized.forEach((it, idx) => {
-    if (it.price_id) {
-      params.set(`line_items[${idx}][price]`, it.price_id);
-      params.set(`line_items[${idx}][quantity]`, String(it.quantity));
-      return;
-    }
-
-    const unit = Math.max(1, Math.floor(it.unit_amount_cents ?? 0));
-    params.set(`line_items[${idx}][price_data][currency]`, (it.currency || "usd").toLowerCase());
-    params.set(`line_items[${idx}][price_data][unit_amount]`, String(unit));
-    params.set(`line_items[${idx}][price_data][product_data][name]`, (it.name || "Item").slice(0, 250));
-    params.set(`line_items[${idx}][quantity]`, String(it.quantity));
+async function createPaidOrderInOrigin(env: Env, payload: unknown): Promise<{ order_id: number }> {
+  const url = joinUrl(env.ORIGIN_BASE_URL, "/internal/edge/create-paid-order/");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Internal-Auth": env.INTERNAL_AUTH_SECRET,
+    },
+    body: JSON.stringify(payload),
   });
 
-  return params;
+  if (!res.ok) {
+    const t = await res.text();
+    // Throw so queue retries (or goes to DLQ) — never lose paid orders
+    throw new Error(`origin_create_paid_order_failed ${res.status}: ${t}`);
+  }
+
+  const j = (await res.json()) as any;
+  const order_id = Number(j?.order_id);
+  if (!Number.isFinite(order_id) || order_id <= 0) {
+    throw new Error(`origin_create_paid_order_invalid_response: ${JSON.stringify(j).slice(0, 500)}`);
+  }
+  return { order_id };
 }
 
-/**
- * Durable Object: authoritative state per idempotency_key.
- */
+// -------------------- Durable Object --------------------
+
 export class MyDurableObject extends DurableObject<Env> {
-  // IMPORTANT: keep a reference to state; don't add a `ctx` property/getter
   private state: DurableObjectState;
 
   constructor(state: DurableObjectState, env: Env) {
@@ -265,54 +494,62 @@ export class MyDurableObject extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/hello") {
-      const name = url.searchParams.get("name") || "world";
-      return json({ greeting: `Hello, ${name}!` }, { status: 200 });
-    }
+    if (url.pathname === "/create" && request.method === "POST") return this.handleCreate(request);
+    if (url.pathname === "/status" && request.method === "GET") return this.handleStatus();
+    if (url.pathname === "/markPaid" && request.method === "POST") return this.handleMarkPaid(request);
+    if (url.pathname === "/finalize" && request.method === "POST") return this.handleFinalize();
 
-    if (url.pathname === "/create" && request.method === "POST") {
-      return this.handleCreate(request);
-    }
-
-    if (url.pathname === "/status" && request.method === "GET") {
-      const session = (await this.state.storage.get<StoredSession>("session")) || null;
-      if (!session) return json({ error: "not_found" }, { status: 404 });
-      return json({ ok: true, session }, { status: 200 });
-    }
-
-    if (url.pathname === "/markPaid" && request.method === "POST") {
-      return this.handleMarkPaid(request);
-    }
+    if (url.pathname === "/hello") return json({ ok: true, hello: "world" }, { status: 200 });
 
     return new Response("Not found", { status: 404 });
   }
 
+  private async handleStatus(): Promise<Response> {
+    const session = (await this.state.storage.get<StoredSession>("session")) || null;
+    if (!session) return json({ error: "not_found" }, { status: 404 });
+    return json({ ok: true, session }, { status: 200 });
+  }
+
   private async handleCreate(request: Request): Promise<Response> {
+    // Idempotent: if already created for this DO instance, return it
     const existing = await this.state.storage.get<StoredSession>("session");
     if (existing) return json({ ok: true, session: existing }, { status: 200 });
 
-    let body: CheckoutRequestBody;
+    let body: any;
     try {
-      body = (await request.json()) as CheckoutRequestBody;
+      body = await request.json();
     } catch {
       return json({ error: "invalid_json" }, { status: 400 });
     }
 
-    const validated = validateCheckoutBody(body);
-    if (!validated.ok) return json({ error: validated.error }, { status: 400 });
+    const effective_key = String(body?.effective_key || "");
+    const nonce = String(body?.nonce || "");
+    const cart_hash = String(body?.cart_hash || "");
+    const normalizedItems = body?.items as unknown;
 
-    const idempotency_key = (validated.value.idempotency_key || "").trim();
-    if (!idempotency_key) return json({ error: "idempotency_key_required" }, { status: 400 });
+    if (!effective_key || !nonce || !cart_hash) {
+      return json({ error: "missing_effective_key_or_nonce_or_cart_hash" }, { status: 400 });
+    }
 
-    const stripeParams = buildStripeSessionParams(this.env, idempotency_key, validated.value.items);
+    const norm = normalizeItems(normalizedItems);
+    if (!norm.ok) return json({ error: norm.error }, { status: 400 });
+
+    const computed = computeLineItems(norm.items);
+
+    // Create Stripe Checkout Session (NO Django call here)
+    const stripeParams = buildStripeSessionParams({
+      env: this.env,
+      effective_key,
+      items: computed,
+    });
 
     const stripeRes = await fetch("https://api.stripe.com/v1/checkout/sessions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.env.STRIPE_SECRET}`,
         "Content-Type": "application/x-www-form-urlencoded",
-        // guarantees Stripe won’t create duplicates if this DO retries
-        "Idempotency-Key": `provost:${idempotency_key}`,
+        // Cart-sensitive idempotency
+        "Idempotency-Key": `provost:${effective_key}`,
       },
       body: stripeParams.toString(),
     });
@@ -326,12 +563,17 @@ export class MyDurableObject extends DurableObject<Env> {
     const session = (await stripeRes.json()) as { id: string; url: string };
 
     const stored: StoredSession = {
-      idempotency_key,
-      session_id: session.id,
+      effective_key,
+      nonce,
+      cart_hash,
+
+      stripe_session_id: session.id,
       checkout_url: session.url,
+
       status: "created",
       created_at: new Date().toISOString(),
-      items: validated.value.items,
+
+      items: computed,
       processed_event_ids: [],
     };
 
@@ -351,52 +593,112 @@ export class MyDurableObject extends DurableObject<Env> {
     const sessionId = String(body?.session_id || "");
     const eventType = String(body?.event_type || "");
 
-    const session = await this.state.storage.get<StoredSession>("session");
-    if (!session) return json({ error: "not_found" }, { status: 404 });
+    const customer_email = body?.customer_email ? String(body.customer_email) : undefined;
+    const customer_phone = body?.customer_phone ? String(body.customer_phone) : undefined;
+    const stripe_customer_id = body?.stripe_customer_id ? String(body.stripe_customer_id) : undefined;
+
+    const stored = await this.state.storage.get<StoredSession>("session");
+    if (!stored) return json({ error: "not_found" }, { status: 404 });
 
     // Ignore if webhook is for different session
-    if (sessionId && session.session_id && sessionId !== session.session_id) {
+    if (sessionId && stored.stripe_session_id && sessionId !== stored.stripe_session_id) {
       return json({ ok: true, status: "ignored_wrong_session" }, { status: 200 });
     }
 
+    // De-dupe by Stripe event id
     if (eventId) {
-      const processed = session.processed_event_ids || [];
+      const processed = stored.processed_event_ids || [];
       if (processed.includes(eventId)) return json({ ok: true, status: "already_processed" }, { status: 200 });
       processed.push(eventId);
-      session.processed_event_ids = processed.slice(-20);
+      stored.processed_event_ids = processed.slice(-50);
     }
 
-    if (session.status !== "paid") {
-      session.status = "paid";
-      session.paid_at = new Date().toISOString();
+    if (stored.status !== "paid") {
+      stored.status = "paid";
+      stored.paid_at = new Date().toISOString();
     }
 
-    await this.state.storage.put("session", session);
+    // capture customer info if present
+    if (customer_email) stored.customer_email = customer_email;
+    if (customer_phone) stored.customer_phone = customer_phone;
+    if (stripe_customer_id) stored.stripe_customer_id = stripe_customer_id;
+
+    await this.state.storage.put("session", stored);
     return json({ ok: true, status: "paid", event_type: eventType }, { status: 200 });
+  }
+
+  private async handleFinalize(): Promise<Response> {
+    const stored = await this.state.storage.get<StoredSession>("session");
+    if (!stored) return json({ error: "not_found" }, { status: 404 });
+
+    if (stored.status !== "paid") {
+      // queue called too early or wrong event type
+      return json({ error: "not_paid" }, { status: 409 });
+    }
+
+    if (stored.order_id) {
+      return json({ ok: true, status: "already_finalized", order_id: stored.order_id }, { status: 200 });
+    }
+
+    const total_cents = stored.items.reduce((sum, it) => sum + it.line_total_cents, 0);
+
+    // Create PAID order in Django now (this is the FIRST time we touch Django)
+    const { order_id } = await createPaidOrderInOrigin(this.env, {
+      effective_key: stored.effective_key,
+      stripe_session_id: stored.stripe_session_id,
+      checkout_url: stored.checkout_url,
+      paid_at: stored.paid_at,
+      currency: "USD",
+      total_cents,
+      customer_email: stored.customer_email,
+      customer_phone: stored.customer_phone,
+      stripe_customer_id: stored.stripe_customer_id,
+      items: stored.items,
+    });
+
+    stored.order_id = order_id;
+    stored.origin_finalized_at = new Date().toISOString();
+    await this.state.storage.put("session", stored);
+
+    return json({ ok: true, status: "finalized", order_id }, { status: 200 });
   }
 }
 
-// ---------- Worker routes ----------
+// -------------------- Worker routes --------------------
+
 async function handleEdgeCheckout(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
 
-  let body: CheckoutRequestBody;
+  let body: EdgeCheckoutRequestBody;
   try {
-    body = (await request.json()) as CheckoutRequestBody;
+    body = (await request.json()) as EdgeCheckoutRequestBody;
   } catch {
     return json({ error: "invalid_json" }, { status: 400 });
   }
 
-  const idempotency_key = (body.idempotency_key || crypto.randomUUID()).trim();
-  const items = body.items || [];
+  const nonce = (body.idempotency_key || crypto.randomUUID()).trim();
 
-  const doId = env.MY_DURABLE_OBJECT.idFromName(`checkout:${idempotency_key}`);
+  const normalized = normalizeItems(body.items);
+  if (!normalized.ok) return json({ error: normalized.error }, { status: 400 });
+
+  // Cart-sensitive idempotency (fixes your “back/change cart” bug)
+  const cartStr = canonicalCartStringForHash(normalized.items);
+  const cart_hash = await sha256Hex(cartStr);
+  const effective_key = `${nonce}.${cart_hash}`;
+
+  // DO instance per effective_key
+  const doId = env.MY_DURABLE_OBJECT.idFromName(`checkout:${effective_key}`);
   const stub = env.MY_DURABLE_OBJECT.get(doId);
 
   const doResp = await stub.fetch("https://do.internal/create", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ idempotency_key, items }),
+    body: JSON.stringify({
+      nonce,
+      cart_hash,
+      effective_key,
+      items: normalized.items,
+    }),
   });
 
   if (!doResp.ok) {
@@ -405,16 +707,38 @@ async function handleEdgeCheckout(request: Request, env: Env): Promise<Response>
   }
 
   const payload = await doResp.json<any>();
+  const session: StoredSession | undefined = payload?.session;
+
   return json(
     {
       ok: true,
-      idempotency_key,
-      session: payload.session,
-      checkout_url: payload.session?.checkout_url,
-      session_id: payload.session?.session_id,
+      idempotency_key: nonce, // keep storing this browser nonce
+      cart_hash,
+      checkout_key: effective_key, // store this per-attempt (used for status polling)
+      checkout_url: session?.checkout_url,
+      stripe_session_id: session?.stripe_session_id,
     },
     { status: 200 }
   );
+}
+
+async function handleEdgeCheckoutStatus(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const k = url.searchParams.get("k") || "";
+  if (!k) return json({ error: "missing_k" }, { status: 400 });
+
+  const doId = env.MY_DURABLE_OBJECT.idFromName(`checkout:${k}`);
+  const stub = env.MY_DURABLE_OBJECT.get(doId);
+
+  const doResp = await stub.fetch("https://do.internal/status", { method: "GET" });
+  if (!doResp.ok) {
+    const t = await doResp.text();
+    return json({ error: "status_failed", details: t }, { status: doResp.status });
+  }
+
+  const data = await doResp.json<any>();
+  // returns { ok:true, session }
+  return json(data, { status: 200 });
 }
 
 async function handleStripeWebhook(request: Request, env: Env): Promise<Response> {
@@ -427,8 +751,15 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   const ok = await verifyStripeWebhook(payloadText, sig, env.STRIPE_WEBHOOK_SECRET);
   if (!ok) return new Response("invalid signature", { status: 400 });
 
+  // Do NOT do heavy work here. Enqueue and return immediately.
   await env.PROVOST_EVENT_QUEUE.send(payloadText);
   return new Response("ok", { status: 200 });
+}
+
+// -------------------- Queue consumer --------------------
+
+function isPaidCheckoutEvent(type: string): boolean {
+  return type === "checkout.session.completed" || type === "checkout.session.async_payment_succeeded";
 }
 
 async function processStripeEventMessage(messageBody: string, env: Env): Promise<void> {
@@ -436,54 +767,61 @@ async function processStripeEventMessage(messageBody: string, env: Env): Promise
   const type = String(ev?.type || "");
   const eventId = String(ev?.id || "");
 
-  const isPaidEvent =
-    type === "checkout.session.completed" ||
-    type === "checkout.session.async_payment_succeeded" ||
-    type === "payment_intent.succeeded";
+  if (!isPaidCheckoutEvent(type)) return;
 
-  if (!isPaidEvent) return;
+  const sessionObj = ev?.data?.object || {};
+  const stripe_session_id = String(sessionObj?.id || "");
+  const effective_key = String(sessionObj?.metadata?.idempotency_key || "");
 
-  // Prefer checkout.session.* (it has metadata)
-  if (type.startsWith("checkout.session.")) {
-    const session = ev?.data?.object || {};
-    const session_id = String(session?.id || "");
-    const idempotency_key = String(session?.metadata?.idempotency_key || "");
-
-    if (!idempotency_key) {
-      console.error("webhook_missing_idempotency_key", { eventId, type, session_id });
-      return;
-    }
-
-    const doId = env.MY_DURABLE_OBJECT.idFromName(`checkout:${idempotency_key}`);
-    const stub = env.MY_DURABLE_OBJECT.get(doId);
-
-    const res = await stub.fetch("https://do.internal/markPaid", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        event_id: eventId,
-        event_type: type,
-        session_id,
-      }),
-    });
-
-    if (!res.ok) {
-      // 5xx => retry
-      if (res.status >= 500) {
-        const t = await res.text();
-        throw new Error(`DO markPaid failed: ${res.status} ${t}`);
-      }
-      // 4xx => permanent
-      console.error("do_markPaid_nonretryable", res.status, await res.text());
-    }
-
+  if (!stripe_session_id || !effective_key) {
+    console.error("webhook_missing_routing", { eventId, type, stripe_session_id, effective_key });
     return;
   }
 
-  // payment_intent.succeeded won't include your session metadata; ignore for now.
-  if (type === "payment_intent.succeeded") {
-    console.warn("payment_intent_succeeded_received_but_not_mapped", { eventId });
+  // Extra safety: only treat as paid if Stripe says paid (for completed)
+  const payment_status = String(sessionObj?.payment_status || "");
+  if (type === "checkout.session.completed" && payment_status && payment_status !== "paid") {
+    // not paid yet; ignore/ack
+    console.warn("checkout_completed_not_paid", { eventId, stripe_session_id, payment_status });
     return;
+  }
+
+  const customer_email = sessionObj?.customer_details?.email;
+  const customer_phone = sessionObj?.customer_details?.phone;
+  const stripe_customer_id = sessionObj?.customer;
+
+  const doId = env.MY_DURABLE_OBJECT.idFromName(`checkout:${effective_key}`);
+  const stub = env.MY_DURABLE_OBJECT.get(doId);
+
+  // 1) mark paid (idempotent)
+  const mark = await stub.fetch("https://do.internal/markPaid", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      event_id: eventId,
+      event_type: type,
+      session_id: stripe_session_id,
+      customer_email,
+      customer_phone,
+      stripe_customer_id,
+    }),
+  });
+
+  if (!mark.ok) {
+    const t = await mark.text();
+    // retry on 5xx by throwing
+    if (mark.status >= 500) throw new Error(`DO markPaid failed ${mark.status}: ${t}`);
+    console.error("do_markPaid_nonretryable", mark.status, t);
+    return;
+  }
+
+  // 2) finalize into Django (ONLY after paid)
+  // If Django is down, this MUST retry (never lose paid orders).
+  const fin = await stub.fetch("https://do.internal/finalize", { method: "POST" });
+  if (!fin.ok) {
+    const t = await fin.text();
+    // Always retry finalization failures (Django might be down)
+    throw new Error(`finalize_failed ${fin.status}: ${t}`);
   }
 }
 
@@ -491,35 +829,34 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Preflight
     if (request.method === "OPTIONS") {
       return applyCors(new Response(null, { status: 204 }), request);
     }
 
-    // Edge-only healthcheck
     if (url.pathname === "/__edge/health") {
       return applyCors(new Response("ok", { status: 200 }), request);
     }
 
-    // Edge-only DO test endpoint
     if (url.pathname === "/__edge/do-hello") {
       if (!isAllowedEdgeAdmin(request, env)) {
         return applyCors(new Response("unauthorized", { status: 401 }), request);
       }
-      const name = url.searchParams.get("name") || "world";
       const id = env.MY_DURABLE_OBJECT.idFromName("default");
       const stub = env.MY_DURABLE_OBJECT.get(id);
-      const doResp = await stub.fetch(`https://do.internal/hello?name=${encodeURIComponent(name)}`);
+      const doResp = await stub.fetch("https://do.internal/hello");
       return applyCors(doResp, request);
     }
 
-    // Edge checkout
     if (url.pathname === "/edge/checkout") {
       const resp = await handleEdgeCheckout(request, env);
       return applyCors(resp, request);
     }
 
-    // Stripe webhook intake
+    if (url.pathname === "/edge/checkout/status") {
+      const resp = await handleEdgeCheckoutStatus(request, env);
+      return applyCors(resp, request);
+    }
+
     if (url.pathname === "/webhooks/stripe") {
       const resp = await handleStripeWebhook(request, env);
       return applyCors(resp, request);
@@ -530,7 +867,6 @@ export default {
     return applyCors(upstream, request);
   },
 
-  // Queue consumer (Wrangler will type this as unknown; we cast inside)
   async queue(batch: MessageBatch, env: Env, ctx: ExecutionContext): Promise<void> {
     for (const msg of batch.messages) {
       try {
@@ -539,7 +875,8 @@ export default {
         await (msg as any).ack?.();
       } catch (err) {
         console.error("queue_process_error", err);
-        throw err; // retry
+        // Throw => Cloudflare retries; if too many retries => DLQ.
+        throw err;
       }
     }
   },
