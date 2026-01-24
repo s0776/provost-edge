@@ -559,10 +559,24 @@ export class MyDurableObject extends DurableObject<Env> {
     return json({ ok: true, session }, { status: 200 });
   }
 
-  private async handleCreate(request: Request): Promise<Response> {
+    private async handleCreate(request: Request): Promise<Response> {
     // Idempotent: if already created for this DO instance, return it
     const existing = await this.state.storage.get<StoredSession>("session");
-    if (existing) return json({ ok: true, session: existing }, { status: 200 });
+    if (existing) {
+      // If the session has already been paid, do NOT return the same checkout_url.
+      // Returning a paid session causes Stripe to show "this session has already been used".
+      if (existing.status === "paid") {
+        return json(
+          {
+            error: "session_already_paid",
+            message: "This checkout session has already been paid; start a fresh checkout attempt.",
+          },
+          { status: 409 }
+        );
+      }
+      // If not paid, return the existing session (idempotent create behavior).
+      return json({ ok: true, session: existing }, { status: 200 });
+    }
 
     let body: any;
     try {
@@ -629,6 +643,7 @@ export class MyDurableObject extends DurableObject<Env> {
     await this.state.storage.put("session", stored);
     return json({ ok: true, session: stored }, { status: 200 });
   }
+
 
   private async handleMarkPaid(request: Request): Promise<Response> {
     let body: any;
